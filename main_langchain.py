@@ -77,17 +77,146 @@ def analyze_company(company_id: str) -> str:
     ).json()
 
 # Создаем инструменты
+@tool
+def set_working_directory(directory: str, workflow: Optional[str] = None) -> Dict[str, str]:
+    """Устанавливает рабочую директорию и фильтр по потоку"""
+    print(f"\n>>> called set_working_directory(directory='{directory}', workflow='{workflow}')")
+    global WORKING_DIRECTORY, CURRENT_WORKFLOW
+    
+    try:
+        if not os.path.isdir(directory):
+            return {"status": "error", "message": "Директория не существует"}
+        
+        WORKING_DIRECTORY = os.path.abspath(directory)
+        CURRENT_WORKFLOW = workflow.lower() if workflow else None
+        return {
+            "status": "success", 
+            "message": f"Директория: {WORKING_DIRECTORY}" + 
+                      (f" | Фильтр: {workflow}" if workflow else "")
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"Ошибка: {str(e)}"}
+
+def should_include_path(path: str) -> bool:
+    """Проверяет, соответствует ли путь фильтру потока, всегда включая dag_utils.py"""
+    path_str = str(path).lower()
+    
+    # Всегда включать dag_utils.py независимо от фильтра
+    if "dag_utils.py" in path_str:
+        return True
+        
+    if not CURRENT_WORKFLOW:
+        return True
+        
+    return CURRENT_WORKFLOW in path_str
+
+@tool
+def list_python_files(subdirectory: Optional[str] = None) -> List[str]:
+    """Список Python и SQL файлов с учётом фильтра потока (включая вложенные папки), файл functions/dag_utils.py относится ко всем потокам, всегда его учитывай"""
+    print(f"\n>>> called list_python_files(subdirectory='{subdirectory}')")
+    
+    try:
+        base_dir = Path(WORKING_DIRECTORY)
+        target_dir = base_dir / subdirectory if subdirectory else base_dir
+        
+        if not target_dir.is_dir():
+            return [f"Ошибка: Директория {target_dir} не существует"]
+        
+        files = []
+        # Ищем как .py, так и .sql файлы
+        for pattern in ["*.py", "*.sql"]:
+            for path in target_dir.rglob(pattern):
+                relative_path = str(path.relative_to(base_dir))
+                
+                # Фильтрация по пути
+                if should_include_path(relative_path):
+                    files.append(relative_path)
+        files.append(relative_path)
+        return files if files else ["Нет файлов, соответствующих фильтру"]
+    
+    except Exception as e:
+        return [f"Ошибка: {str(e)}"]
+
+@tool
+def read_python_file(filename: str) -> str:
+    """Читает Python или SQL файл, если он соответствует фильтру потока """
+    print(f"\n>>> called read_python_file(filename='{filename}')")
+    
+    if CURRENT_WORKFLOW and not should_include_path(filename):
+        return f"Файл не соответствует фильтру '{CURRENT_WORKFLOW}'"
+    
+    filepath = Path(WORKING_DIRECTORY) / filename
+    try:
+        content = filepath.read_text(encoding="utf-8")
+        return content if content else "Файл пустой"
+    except Exception as e:
+        return f"Ошибка чтения: {str(e)}"
+
+@tool
+def summarize_python_file(filename: str) -> str:
+    """Анализирует Python или SQL файл, если он соответствует фильтру потока"""
+    print(f"\n>>> called summarize_python_file(filename='{filename}')")
+    
+    content = read_python_file.invoke(filename)
+    if content.startswith("Ошибка") or content == "Файл пустой":
+        return content
+    
+    try:
+        file_type = "SQL" if filename.lower().endswith('.sql') else "Python"
+        return giga.invoke(
+            f"Детально проанализируй {file_type} код файла {filename}:\n\n{content}"
+        )
+    except Exception as e:
+        return f"Ошибка анализа: {str(e)}"
+
+@tool
+def create_python_file(
+    filename: str,
+    code_content: str,
+    subdirectory: Optional[str] = None,
+    overwrite: bool = False,
+    file_type: str = "python"  # Добавлен параметр для указания типа файла
+) -> Dict[str, str]:
+    """Создаёт Python или SQL файл с учётом структуры проекта"""
+    print(f"\n>>> called create_python_file(filename='{filename}', file_type='{file_type}')")
+    try:
+        base_path = Path(WORKING_DIRECTORY)
+        full_path = base_path / subdirectory / filename if subdirectory else base_path / filename
+        
+        # Определяем расширение файла в зависимости от типа
+        if file_type.lower() == "sql" and not filename.lower().endswith('.sql'):
+            full_path = full_path.with_suffix('.sql')
+        elif file_type.lower() == "python" and not (filename.lower().endswith('.py') or filename.lower().endswith('.sql')):
+            full_path = full_path.with_suffix('.py')
+        
+        if full_path.exists() and not overwrite:
+            return {
+                "status": "error",
+                "message": f"Файл {filename} уже существует",
+                "path": str(full_path.relative_to(base_path))
+            }
+        
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(code_content, encoding="utf-8")
+        
+        return {
+            "status": "success",
+            "message": f"Файл создан: {full_path.relative_to(base_path)}",
+            "path": str(full_path.relative_to(base_path))
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Ошибка: {str(e)}",
+            "path": str(full_path.relative_to(base_path)) if 'full_path' in locals() else filename
+        }
+
 tools = [
-    Tool(
-        name="get_companies",
-        func=get_companies,
-        description="Используется для получения списка всех отделений в формате: ID name address. Принимает любую строку как параметр."
-    ),
-    Tool(
-        name="analyze_company",
-        func=analyze_company,
-        description="Используется для анализа конкретного отделения. Принимает ID компании как вход (целое число)."
-    )
+    set_working_directory,
+    list_python_files,
+    read_python_file,
+    summarize_python_file,
+    create_python_file
 ]
 
 # Инициализация GigaChat
@@ -98,21 +227,16 @@ giga = GigaChat(
 )
 
 # Настройка промпта
-prompt = ChatPromptTemplate.from_messages([
-    SystemMessage(content="""Ты - управляющий директор компании, анализирующий мнение клиентов. 
-У тебя есть доступ к данным о компаниях и их отзывах. Отвечай профессионально и по делу.
-при запросе информации об отделении форматируй ответ с переносом строки, например:
-- id 
-- name 
-- address
-Средний рейтинг этого отделения составляет 1.0
-В числе рисков отмечается недовольство клиентов качеством обслуживания, выраженное в комментарии "Сбер банк стал самым ужасным банком".
+prompt = f"""Ты файловый менеджер для Python и SQL проектов. Текущая рабочая директория: {WORKING_DIRECTORY}
+Ты можешь:
+1. Устанавливать рабочую директорию и поток (set_working_directory)
+2. Перечислять Python и SQL файлы (list_python_files)
+3. Читать содержимое файлов (read_python_file)
+4. Анализировать код и просматривать его содержимое (summarize_python_file)
+5. Создавать новые файлы (create_python_file) - укажи 'file_type="sql"' для SQL файлов
 
-
-"""),
-    ("human", "{input}"),
-    MessagesPlaceholder(variable_name="agent_scratchpad")
-])
+Все операции учитывают текущий фильтр по потоку: {CURRENT_WORKFLOW or 'нет фильтра'} Также всегда при проведении любой операции по потоку, учитывай файл
+functions/dag_utils.py, который не содержит потока в названии, но относится ко всем потокам"""
 
 # Создание агента
 agent = create_openai_tools_agent(
@@ -131,9 +255,7 @@ agent_executor = AgentExecutor(
 
 # Основной цикл
 def main():
-    print("Приветствую! Я ваш виртуальный помощник для анализа отзывов о отделениях.")
-    print("Вы можете запросить список всех отделений или аналитику по конкретному отделению.")
-    print("Для выхода введите 'выход' или 'exit'.")
+    print("Приветствую! Я агент-тестировщик.")
 
     while True:
         user_input = input("\nВаш запрос: ").strip()
